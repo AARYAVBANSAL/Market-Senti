@@ -1,1 +1,116 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.preprocessing import StandardScaler
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
+def load_stock_data(ticker, start, end):
+    df = yf.download(ticker, start=start, end=end)
+    df["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
+    df["volatility"] = df["log_return"].rolling(10).std()
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.dropna(inplace=True)
+    return df
+
+def load_news(ticker):
+    stock = yf.Ticker(ticker)
+    news = stock.news
+    if not news:
+        return pd.DataFrame(columns=["date", "title"])
+    news_df = pd.DataFrame(news)
+    time_col = None
+    for col in ["providerPublishTime", "publishedAt", "pubDate"]:
+        if col in news_df.columns:
+            time_col = col
+            break
+    if time_col is None:
+        return pd.DataFrame(columns=["date", "title"])
+    if news_df[time_col].dtype == "int64":
+        news_df["date"] = pd.to_datetime(news_df[time_col], unit="s").dt.date
+    else:
+        news_df["date"] = pd.to_datetime(news_df[time_col]).dt.date
+    return news_df[["date", "title"]]
+
+tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+finbert = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+
+def finbert_sentiment(texts):
+    inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+    with torch.no_grad():
+        outputs = finbert(**inputs)
+    probs = F.softmax(outputs.logits, dim=1)
+    return (probs[:, 2] - probs[:, 0]).numpy()
+
+def compute_daily_sentiment(news_df):
+    sentiment = {}
+    for date, group in news_df.groupby("date"):
+        scores = finbert_sentiment(group["title"].tolist())
+        sentiment[date] = float(np.mean(scores))
+    return sentiment
+
+def merge_sentiment(price_df, sentiment_dict):
+    price_df["date"] = price_df.index.date
+    price_df["sentiment"] = price_df["date"].map(sentiment_dict)
+    price_df["sentiment"] = price_df["sentiment"].fillna(0.0)
+    price_df.drop(columns=["date"], inplace=True)
+    price_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    price_df.dropna(inplace=True)
+    return price_df
+
+def create_sequences(data, window=30):
+    X, y = [], []
+    for i in range(len(data) - window):
+        X.append(data[i:i+window])
+        y.append(data[i+window, 0])
+    return np.array(X), np.array(y)
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size=64):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, 1)
+    def forward(self, x):
+        _, (h, _) = self.lstm(x)
+        return self.fc(h[-1])
+
+def train_model(X, y, epochs=10):
+    model = LSTMModel(X.shape[2])
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    loss_fn = nn.MSELoss()
+    X_t = torch.tensor(X, dtype=torch.float32)
+    y_t = torch.tensor(y, dtype=torch.float32).view(-1, 1)
+    for _ in range(epochs):
+        optimizer.zero_grad()
+        preds = model(X_t)
+        loss = loss_fn(preds, y_t)
+        loss.backward()
+        optimizer.step()
+    return model
+
+def trading_signal(pred, sentiment):
+    if pred > 0 and sentiment > 0:
+        return "BUY"
+    if pred < 0 and sentiment < 0:
+        return "SELL"
+    return "HOLD"
+
+if __name__ == "__main__":
+    ticker = "AAPL"
+    prices = load_stock_data(ticker, "2019-01-01", "2023-01-01")
+    news_df = load_news(ticker)
+    daily_sentiment = compute_daily_sentiment(news_df)
+    prices = merge_sentiment(prices, daily_sentiment)
+    features = prices[["log_return", "volatility", "sentiment"]].values
+    scaler = StandardScaler()
+    features = scaler.fit_transform(features)
+    assert not np.isnan(features).any()
+    X, y = create_sequences(features, 30)
+    model = train_model(X, y)
+    pred = model(torch.tensor(X[-1:], dtype=torch.float32)).item()
+    sent = prices["sentiment"].iloc[-1]
+    print("Predicted Return:", pred)
+    print("Sentiment:", sent)
+    print("Trading Signal:", trading_signal(pred, sent))
